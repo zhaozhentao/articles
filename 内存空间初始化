@@ -1,0 +1,159 @@
+在继续创建进程之前（ fork ），我们需要先处理一下内存分配相关事项，简单来说是因为将来创建的每个进程需要有属于该进程的内存空间，用来存放代码和数据（代码段和数据段）。像前面说的假设我们的机器一共有 16M 内存，除去前面存放内核代码和高速缓冲区占用的内存，剩下的部分我们称为主内存。回忆一下前面的内存分布示意图。
+
+<div style="text-align: center">
+<img src="http://coding.bozhen.live/upload/2023_05_03/08_21_10_image.png" style="width: 400px;">
+</div>
+
+上面的主内存就是将来各种用户程序运行的舞台。
+
+内核中使用一个字节数组 mem_map 来管理这个主内存区，和前面说的一样，内存按一页 4k 来划分，mem_map 中每项的数值代表其所指向的一页内存被引用的次数。
+
+我们需要在内核启动阶段初始化一下上面说的这个 mem_map 数组。下面就是其初始化函数 mem_init 。该函数首先将所有数组项都标记为占用，然后再从真正可分配的内存页开始，将数组项清零，表示可分配。从代码中可以看出，mem_map 的 0 号元素指向 1M 处，而 1M 到上图中的 main_memory_start 之间的内存实际上是内核占用的，所以初始化时直接标记为 USED。
+
+```diff
+diff --git a/mm/memory.c b/mm/memory.c
+new file mode 100644
+index 0000000..d0c7ad6
+--- /dev/null
++++ b/mm/memory.c
+@@ -0,0 +1,28 @@
++#define LOW_MEM 0x100000
++#define PAGING_MEMORY (15*1024*1024)           // 主内存最多15M
++#define PAGING_PAGES (PAGING_MEMORY>>12)       // 分页后的内存页数
++#define MAP_NR(addr) (((addr)-LOW_MEM)>>12)    // 内存地址映射为页号
++#define USED 100
++
++static long HIGH_MEMORY = 0;
++
++// 物理内存字节映射图，一字节代表一页 (4K) ，每个字节保存的数值表示该内存页被引用的次数
++static unsigned char mem_map [ PAGING_PAGES ] = {0,};
++
++void mem_init(long start_mem, long end_mem)
++{
++    int i;
++
++    // 首先简单将所有数组项都标记为占用
++    HIGH_MEMORY = end_mem;
++    for (i=0 ; i<PAGING_PAGES ; i++)
++        mem_map[i] = USED;
++    // 计算第一个可分配的内存页号
++    i = MAP_NR(start_mem);
++    end_mem -= start_mem;
++    end_mem >>= 12;
++    // 从第一个可分配的页号开始将映射图数组清零，直到最后一页，表示后面的内存页全部可用
++    while (end_mem-->0)
++        mem_map[i++]=0;
++}
++
+```
+
+用一个图来示意初始化后的结果。
+
+<div style="text-align: center">
+<img src="http://coding.bozhen.live/upload/2023_10_04/21_58_15_image.png" style="width: 600px;">
+</div>
+
+在 main 函数中调用上面的初始化函数。
+
+```diff
+diff --git a/init/main.c b/init/main.c
+index 23b10a4..e4011a2 100644
+--- a/init/main.c
++++ b/init/main.c
+@@ -37,6 +37,7 @@ void main(void) {
+         buffer_memory_end = 1*1024*1024;         // 如果内存小于 6M ，则 1M 以下的内存归内核使用
+     main_memory_start = buffer_memory_end;       // main_memory_start 就是将来用来运行应用程序的内存，以内核内存结束的地
+ 
++    mem_init(main_memory_start,memory_end);
+     con_init();
+     trap_init();
+     blk_dev_init();                                 // 初始化块设备结构
+```
+
+修改一下 Makefile 使上面的代码生效。
+
+```diff
+diff --git a/mm/Makefile b/mm/Makefile                                                                              [0/17]
+new file mode 100644
+index 0000000..b23b84d
+--- /dev/null
++++ b/mm/Makefile
+@@ -0,0 +1,31 @@
++include ../Makefile.header
++
++LDFLAGS += -r
++CFLAGS += -I../include
++CPP    += -I../include
++
++.c.o:
++       @$(CC) $(CFLAGS) \
++       -c -o $*.o $<
++.s.o:
++       @$(AS) -o $*.o $<
++.c.s:
++       @$(CC) $(CFLAGS) \
++       -S -o $*.s $<
++
++OBJS = memory.o
++
++all: mm.o
++
++mm.o: $(OBJS)
++       $(LD) $(LDFLAGS) -o mm.o $(OBJS)
++
++clean:
++       rm -f core *.o *.a tmp_make
++       for i in *.c;do rm -f `basename $$i .c`.s;done
++
++memory.o: memory.c ../include/signal.h ../include/sys/types.h \
++  ../include/asm/system.h ../include/linux/sched.h \
++  ../include/linux/head.h ../include/linux/fs.h ../include/linux/mm.h \
++  ../include/linux/kernel.h
++
+```
+
+```diff
+diff --git a/Makefile b/Makefile
+index d9f3767..122cd14 100644
+--- a/Makefile
++++ b/Makefile
+@@ -5,7 +5,7 @@ include Makefile.header
+ LDFLAGS        += -Ttext 0 -e startup_32
+ CFLAGS += -Iinclude
+ 
+-ARCHIVES=kernel/kernel.o fs/fs.o
++ARCHIVES=kernel/kernel.o mm/mm.o fs/fs.o
+ DRIVERS=kernel/blk_drv/blk_drv.a kernel/chr_drv/chr_drv.a
+ LIBS   =lib/lib.a
+ 
+@@ -26,6 +26,9 @@ Image: boot/bootsect boot/setup tools/system
+        tools/build.sh boot/bootsect boot/setup tools/kernel Image
+        $(OBJDUMP) -D -m i386 tools/system > system.dis
+ 
++mm/mm.o:
++       make -C mm
++
+ fs/fs.o:
+        make -C fs
+ 
+@@ -68,7 +71,7 @@ stop:
+ 
+ clean:
+        rm -f Image *.dis *.tmp init/*.o system.debug System.map
+-       for i in boot fs kernel lib; do make clean -C $$i; done
++       for i in mm fs kernel lib boot; do make clean -C $$i; done
+ 
+ init/main.o: init/main.c
+ 
+```
+
+### 小结
+
+本节主要初始化了用来管理内存页的数组 mem_map ，认识了主内存大概的分布。
+
+```shell
+git add .
+git commit -m "初始化 mem_map 结构"
+```
+
+欢度国庆 🎉 。
